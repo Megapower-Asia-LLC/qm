@@ -1009,12 +1009,18 @@ export function piLastAssistantTextOrThrow(session: AssistantTextSession): strin
   return session.getLastAssistantText();
 }
 
+function messagesSince(session: AssistantTextSession, messagesBefore?: number): AssistantTextSession {
+  return messagesBefore === undefined
+    ? session
+    : ({ messages: session.messages.slice(messagesBefore) } as AssistantTextSession);
+}
+
+function piRoundFailed(session: AssistantTextSession, messagesBefore: number): boolean {
+  return !!piFailedAssistant(messagesSince(session, messagesBefore));
+}
+
 export function piTurnError(session: AssistantTextSession, thrown: unknown, messagesBefore?: number): Error {
-  const fresh =
-    messagesBefore === undefined
-      ? session
-      : ({ messages: session.messages.slice(messagesBefore) } as AssistantTextSession);
-  const detailed = piAssistantFailure(fresh);
+  const detailed = piAssistantFailure(messagesSince(session, messagesBefore));
   if (detailed) return detailed;
   return thrown instanceof Error ? thrown : new Error(String(thrown));
 }
@@ -1027,11 +1033,7 @@ export function isProviderRefusal(message: string | undefined): boolean {
 }
 
 export function providerRefusalError(session: AssistantTextSession, messagesBefore?: number): string | null {
-  const fresh =
-    messagesBefore === undefined
-      ? session
-      : ({ messages: session.messages.slice(messagesBefore) } as AssistantTextSession);
-  const err = piAssistantError(fresh);
+  const err = piAssistantError(messagesSince(session, messagesBefore));
   return err && isProviderRefusal(err) ? err : null;
 }
 
@@ -2250,15 +2252,17 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           const rawRemainingCapMs = floorCap.remainingCapMs;
           const raceCapMs = floorCap.raceCapMs;
           const extendCapMs = floorCap.extendMs;
+          const refusedModelIds = new Set<string>();
           const attemptRefusalFallback = async (refusal: string): Promise<boolean> => {
             if (userAborted || turn.cancel?.aborted) return false;
             const fromId = (entry.agentSession.model as { id?: string } | undefined)?.id;
+            if (fromId) refusedModelIds.add(fromId);
             const configured = opts?.resolveFallbackRuntime?.();
             const fallbackId = fromId
               ? refusalFallbackModelId(fromId, configured?.modelId, (id) => !!resolveModel(id, !turn.providerKeys))
               : undefined;
             const fallback = fallbackId ? resolveModel(fallbackId, !turn.providerKeys) : undefined;
-            if (!fallbackId || !fallback) return false;
+            if (!fallbackId || !fallback || refusedModelIds.has(fallbackId)) return false;
             const capMs = raceCapMs();
             if (turnWallClockMs > 0 && capMs < EMPTY_ENDING_MIN_BUDGET_MS) return false;
             console.error(
@@ -2291,6 +2295,17 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             if (outcome !== "ok") throw new NonRetryableTurnError(refusal);
             return true;
           };
+          const recoverRefusedRound = async (): Promise<void> => {
+            if (entry.ref.runtimeHandoff || userAborted || turn.cancel?.aborted) return;
+            const refusal = providerRefusalError(entry.agentSession, messagesBefore);
+            if (!refusal) return;
+            try {
+              await attemptRefusalFallback(refusal);
+            } catch (e) {
+              swallow("pi: refusal fallback", e);
+              throw new NonRetryableTurnError(refusal);
+            }
+          };
           try {
             const images = turn.images?.length
               ? turn.images.map((i) => ({ type: "image" as const, data: i.dataBase64, mimeType: i.mimeType }))
@@ -2305,6 +2320,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                 abort: () => entry.agentSession.abort(),
               },
             );
+            if (wallClock === "ok") await recoverRefusedRound();
             const goalAfterPrompt = entry.ref.goal;
             if (
               wallClock === "ok" &&
@@ -2323,7 +2339,8 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                   !!turn.cancel?.aborted ||
                   !!entry.ref.runtimeHandoff ||
                   !!entry.ref.pausedOnApproval ||
-                  !!entry.ref.pendingApprovals?.length,
+                  !!entry.ref.pendingApprovals?.length ||
+                  piRoundFailed(entry.agentSession, messagesBefore),
                 beforePrompt: async (note) => {
                   console.error(
                     `[goal] continuation session=${turn.session.id} round=${(entry.ref.goalRound ?? 0) + 1}`,
@@ -2333,27 +2350,17 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                   entry.ref.silentRequested = false;
                   await thinkTail;
                 },
-                prompt: (note) => {
-                  if (turnWallClockMs > 0 && rawRemainingCapMs() < EMPTY_ENDING_MIN_BUDGET_MS)
-                    return Promise.resolve<TurnWallClockOutcome>("aborted");
-                  return raceTurnWallClock(entry.agentSession.prompt(note), {
+                prompt: async (note) => {
+                  if (turnWallClockMs > 0 && rawRemainingCapMs() < EMPTY_ENDING_MIN_BUDGET_MS) return "aborted";
+                  const outcome = await raceTurnWallClock(entry.agentSession.prompt(note), {
                     capMs: raceCapMs(),
                     extendMs: extendCapMs,
                     abort: () => entry.agentSession.abort(),
                   });
+                  if (outcome === "ok") await recoverRefusedRound();
+                  return outcome;
                 },
               });
-            }
-            if (wallClock === "ok" && !entry.ref.runtimeHandoff && !userAborted && !turn.cancel?.aborted) {
-              const refusal = providerRefusalError(entry.agentSession, messagesBefore);
-              if (refusal) {
-                try {
-                  await attemptRefusalFallback(refusal);
-                } catch (e) {
-                  swallow("pi: refusal fallback", e);
-                  throw new NonRetryableTurnError(refusal);
-                }
-              }
             }
             const note = emptyEndingNote({
               wallClock,
