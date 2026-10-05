@@ -101,7 +101,7 @@ import {
   type PiReplayMessage,
   type SeededMessage,
 } from "./replay.ts";
-import { assistantDroppedAtReplay, ELIDED_IMAGE_TEXT, planTapeSeed } from "./tape-fold.ts";
+import { assistantDroppedAtReplay, ELIDED_IMAGE_TEXT, planTapeSeed, withResumedToolResult } from "./tape-fold.ts";
 import { estimateHistoryTokens, INTERRUPTED_TOOL_RESULT } from "./context-compaction.ts";
 import { summarizeHistory } from "./history-summary.ts";
 import { countTokens } from "../util/tokens.ts";
@@ -1868,10 +1868,17 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           scopeLabel: dispatched.scopeLabel,
           orgScopeId: dispatched.orgScopeId,
           toolApprovalGate: dispatched.toolApprovalGate,
+          shutdown: dispatched.shutdown,
         };
         const tools = createTurnTools(ref, dispatched);
         const resumed = await resumeInterruptedToolCall(dispatched, ref, tools as unknown as BridgedTool[]);
-        const turn = resumed ? { ...dispatched, history: resumed.history } : dispatched;
+        const turn = resumed
+          ? {
+              ...dispatched,
+              history: resumed.history,
+              ...(dispatched.tapeFold ? { tapeFold: withResumedToolResult(dispatched.tapeFold, resumed.message) } : {}),
+            }
+          : dispatched;
         if (resumed) {
           const callId = resumed.message.toolCallId;
           const resultScope = ref.tapeResultScopes?.get(callId);
@@ -2000,10 +2007,14 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             const callId = role === "toolResult" ? (message as { toolCallId?: unknown }).toolCallId : undefined;
             const resultScope = typeof callId === "string" ? entry.ref.tapeResultScopes?.get(callId) : undefined;
             if (typeof callId === "string") entry.ref.tapeResultScopes?.delete(callId);
+            const taped = stripImageBytes(message, isTrigger ? turn.images : steer?.images);
             const rec: NewTapeRecord = {
               kind: "message",
               harness: "pi",
-              payload: stripImageBytes(message, isTrigger ? turn.images : steer?.images),
+              payload:
+                role === "toolResult" && turn.shutdown?.aborted
+                  ? { ...(taped as Record<string, unknown>), interrupted: true }
+                  : taped,
               scopeLabel: resultScope ?? turn.scopeLabel,
               ...(isTrigger && userEntry
                 ? {
