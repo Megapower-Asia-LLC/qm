@@ -15,10 +15,7 @@ import {
   dmThreadRef,
   openConversationFor,
   findPostedByKey,
-  messageExists,
-  messagePinned,
   parseDeliveryTarget,
-  reactionPresent,
   statusPlaceholderKey,
   postWithVerify,
   recoveryVerifyOldest,
@@ -48,6 +45,8 @@ const PERMANENT_POST_ERRORS = new Set([
   "cannot_reply_to_message",
   "message_not_found",
 ]);
+
+const SETTLED_PIN_ERRORS = new Set(["already_pinned", "no_pin", "not_pinned"]);
 
 const DELIVERY_CLAIM_MARGIN_MS = 2_000;
 
@@ -242,10 +241,8 @@ export function createDeliveryPoller(deps: {
                 await deliverKeychainCard(core, client, d, channel, threadTs, deps.webUiPublicUrl);
                 return undefined;
               }
-              const recovered = recoveredRow(d);
               if (d.destination.react) {
                 const { messageTs, emoji } = d.destination.react;
-                if (recovered && (await reactionPresent(client, channel, messageTs, emoji))) return undefined;
                 const { failed } = await applyReactions(client, channel, messageTs, [emoji]);
                 if (failed.length)
                   console.error(
@@ -255,13 +252,12 @@ export function createDeliveryPoller(deps: {
               }
               if (d.destination.pin) {
                 const { messageTs, remove } = d.destination.pin;
-                if (recovered && (await messagePinned(client, channel, messageTs)) === !remove) return undefined;
                 try {
                   if (remove) await client.pins.remove({ channel, timestamp: messageTs });
                   else await client.pins.add({ channel, timestamp: messageTs });
                 } catch (err) {
-                  const code = (err as { data?: { error?: string } })?.data?.error;
-                  if (code !== "already_pinned" && code !== "no_pin" && code !== "not_pinned")
+                  const code = slackErrorCode(err);
+                  if (!code || !SETTLED_PIN_ERRORS.has(code))
                     console.error(
                       `[slack-plugin] delivery ${d.id} native ${remove ? "unpin" : "pin"} failed: ${code ?? (err as Error).message}`,
                     );
@@ -270,13 +266,14 @@ export function createDeliveryPoller(deps: {
               }
               if (d.destination.delete) {
                 const { messageTs } = d.destination.delete;
-                if (recovered && (await messageExists(client, channel, messageTs)) === false) return undefined;
                 try {
                   await client.chat.delete({ channel, ts: messageTs });
                 } catch (err) {
-                  console.error(
-                    `[slack-plugin] delivery ${d.id} delete failed: ${slackErrorCode(err) ?? (err as Error).message} (own messages only)`,
-                  );
+                  const code = slackErrorCode(err);
+                  if (code !== "message_not_found")
+                    console.error(
+                      `[slack-plugin] delivery ${d.id} delete failed: ${code ?? (err as Error).message} (own messages only)`,
+                    );
                 }
                 return undefined;
               }
