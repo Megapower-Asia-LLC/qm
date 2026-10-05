@@ -16,6 +16,8 @@ export function isResumeNote(text: string): boolean {
   return text.trimStart().startsWith(NOTE_HEAD);
 }
 
+const MODEL_TURN_ENTRY_TYPES = new Set<SessionEntry["type"]>(["user", "assistant", "tool_call", "tool_result"]);
+
 export function findTrailingPartialTurn(entries: readonly SessionEntry[], inputText: string): PartialTurn | null {
   const text = inputText.trim();
   if (!text) return null;
@@ -76,7 +78,8 @@ export interface ResumableToolCall {
   input: Record<string, unknown>;
 }
 
-export type ResumeStrategy = { kind: "restart" } | { kind: "note" } | { kind: "retry"; call: ResumableToolCall };
+export type ResumeStrategy =
+  { kind: "restart" } | { kind: "note" } | { kind: "continue" } | { kind: "retry"; call: ResumableToolCall };
 
 export function resumeStrategy(entries: readonly SessionEntry[], partial: PartialTurn): ResumeStrategy {
   if (partial.workEntries === 0) return { kind: "restart" };
@@ -89,6 +92,10 @@ export function resumeStrategy(entries: readonly SessionEntry[], partial: Partia
   const dangling = turn.filter(
     (e) => e.type === "tool_call" && !answered.has((e.payload as { callId?: unknown } | null)?.callId),
   );
+  if (dangling.length === 0) {
+    const last = turn.findLast((e) => MODEL_TURN_ENTRY_TYPES.has(e.type));
+    return last?.type === "tool_result" ? { kind: "continue" } : { kind: "note" };
+  }
   if (dangling.length !== 1) return { kind: "note" };
   const payload = dangling[0]!.payload as {
     callId?: unknown;
