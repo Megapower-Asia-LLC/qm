@@ -11,7 +11,7 @@ import { createAdmittedWork } from "./util/admitted-work.ts";
 import { runSessionSmoke } from "./deployment/postdeploy-smoke.ts";
 import {
   createBackgroundOwnershipStore,
-  type BackgroundOwnershipStore,
+  type BackgroundOwnershipControl,
   type BackgroundOwnership,
 } from "./runs/background-ownership.ts";
 import { loadConnectorSdk } from "./sandbox/connector-sdk.ts";
@@ -338,7 +338,6 @@ import { isTerminal, type Run, type RunStore } from "./runs/run-store.ts";
 import { createWorker, type Worker } from "./runs/worker.ts";
 import {
   createNoopInstanceRegistry,
-  createLegacyEnrollmentBridge,
   createPostgresInstanceRegistry,
   type InstanceRegistry,
 } from "./runs/instance-registry.ts";
@@ -428,7 +427,7 @@ export interface Runtime {
   start(): void;
   startBackground(): void;
   stopBackgroundClaims(): Promise<void>;
-  setBackgroundAdmission(check: () => boolean): void;
+  setBackgroundAdmission(canClaim: () => boolean, active: () => boolean): void;
   stopBackground(): Promise<void>;
   backgroundDrained(): Promise<void>;
   stop(): Promise<void>;
@@ -469,7 +468,7 @@ export function stopWithBackstop(
 
 export interface BuiltApp {
   checkReadiness: (signal: AbortSignal) => Promise<void>;
-  backgroundOwnership?: { store: BackgroundOwnershipStore; instanceId: string; deploymentId: string };
+  backgroundOwnership?: BackgroundOwnershipControl;
   suggestedActivityMaintenance: Sweeper;
   suggestedActivities?: ReturnType<typeof createSuggestedActivityService>;
   app: App;
@@ -575,6 +574,7 @@ export function buildApp(
   } = {},
 ): BuiltApp {
   let backgroundAdmission = () => !config.backgroundDeploymentId;
+  let backgroundActive = () => false;
   const admittedWork = createAdmittedWork({
     canStart: () => !config.backgroundDeploymentId || backgroundAdmission(),
   });
@@ -2540,37 +2540,22 @@ export function buildApp(
     directory,
     currentScopeMembers,
   });
-  const backgroundOwnership = config.backgroundDeploymentId
+  const backgroundOwnership: BackgroundOwnershipControl | undefined = config.backgroundDeploymentId
     ? {
         store: createBackgroundOwnershipStore(artifactMap<BackgroundOwnership>("background_ownership")),
         instanceId: randomUUID(),
         deploymentId: config.backgroundDeploymentId,
+        active: () => backgroundActive(),
       }
     : undefined;
-  const legacyRegistry =
-    pgArtifactMap && (backgroundOwnership || (config.buildSha && config.backgroundWorkEnabled))
+  const instanceRegistry: InstanceRegistry =
+    pgArtifactMap && !backgroundOwnership && config.buildSha && config.backgroundWorkEnabled
       ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
           instanceId: randomUUID(),
-          buildSha: backgroundOwnership ? `enrollment:${backgroundOwnership.deploymentId}` : config.buildSha!,
+          buildSha: config.buildSha,
           startedAt: Date.now(),
         })
       : createNoopInstanceRegistry();
-  const instanceRegistry: InstanceRegistry = backgroundOwnership
-    ? createLegacyEnrollmentBridge(legacyRegistry, async () => {
-        if (!config.backgroundWorkEnabled || !backgroundAdmission()) return false;
-        const state = await backgroundOwnership.store.get();
-        const member = state.members.find((entry) => entry.instanceId === backgroundOwnership.instanceId);
-        return (
-          !state.enabled &&
-          state.generation === 0 &&
-          member?.generation === 0 &&
-          !member.retired &&
-          member.state === "admitted" &&
-          member.ready &&
-          backgroundAdmission()
-        );
-      })
-    : legacyRegistry;
   const drain: DrainController = createDrainController({ registry: instanceRegistry });
   const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
     createWorker({
@@ -2742,8 +2727,9 @@ export function buildApp(
       if (config.backgroundWorkEnabled && !config.backgroundDeploymentId) startBackground();
     },
     startBackground,
-    setBackgroundAdmission(check) {
-      backgroundAdmission = check;
+    setBackgroundAdmission(canClaim, active) {
+      backgroundAdmission = canClaim;
+      backgroundActive = active;
     },
     async stopBackgroundClaims() {
       void stopBackground().catch(swallowAs("wiring: background drain failed", undefined));
