@@ -261,9 +261,15 @@ export function foldTape(rows: readonly TapeRecord[]): unknown[] {
       }
       continue;
     }
-    if (row.kind === "message" && row.payload != null) f.out.push(row.payload);
+    if (row.kind === "message" && row.payload != null) f.out.push(interruptedResultPlaceholder(row.payload));
   }
   return f.out;
+}
+
+function interruptedResultPlaceholder(message: unknown): unknown {
+  const msg = message as { role?: string; interrupted?: unknown; content?: unknown };
+  if (msg?.role !== "toolResult" || msg.interrupted !== true) return message;
+  return { ...msg, content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT }], isError: true };
 }
 
 const LEGACY_CONTINUATION_LINE = "(continuing after the tool result above)";
@@ -317,6 +323,22 @@ export function planTapeSeed(
   const fold = folded ? [...folded] : foldTape(rows);
   const lint = lintFold(fold);
   return { seed: mode === "serve" && lint.ok && fold.length ? fold : null, lint, fold };
+}
+
+export function openTapeToolCalls(rows: readonly TapeRecord[]): { messages: number; open: string[] } {
+  const fold = foldTape(rows);
+  const answered = new Set<string>();
+  const calls: string[] = [];
+  for (const m of fold) {
+    const msg = m as { role?: string; toolCallId?: string; content?: unknown };
+    if (msg?.role === "toolResult" && typeof msg.toolCallId === "string") answered.add(msg.toolCallId);
+    if (msg?.role !== "assistant" || !Array.isArray(msg.content) || assistantDroppedAtReplay(m)) continue;
+    for (const block of msg.content) {
+      const b = block as { type?: string; id?: string };
+      if (b?.type === "toolCall" && typeof b.id === "string") calls.push(b.id);
+    }
+  }
+  return { messages: fold.length, open: calls.filter((id) => !answered.has(id)) };
 }
 
 export function tapeNeedsInterruptHeal(rows: readonly TapeRecord[], folded?: readonly unknown[]): boolean {
